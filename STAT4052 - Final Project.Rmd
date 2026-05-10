@@ -1,0 +1,151 @@
+---
+title: "STAT4052 Final Project"
+author: "Julianna"
+date: "2026-05-06"
+output: pdf_document
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(MASS)
+library(car)
+library(glmnet)
+library(randomForest)
+library(gridExtra)
+
+# Data Prep
+raw_data <- read_csv("C:/Users/julia/Downloads/Austin_Animal_Center_Outcomes_20260506.csv")
+
+clean_data <- raw_data %>%
+  filter(Type == "Dog") %>%
+  mutate(
+    Days_in_Shelter = as.numeric(gsub(",", "", `Days in Shelter`)),
+    DOB = ymd_hms(`Date of Birth`),
+    Intake_Date = ymd_hms(`Intake Date`),
+    Age_at_Intake = as.numeric(difftime(Intake_Date, DOB, units = "days")) / 365.25,
+    Intake_Month = factor(month(Intake_Date, label = TRUE)),
+    sqrt_days = sqrt(Days_in_Shelter)
+  ) %>%
+  mutate(Breed_Cluster = case_when(
+    grepl("Pit Bull", `Primary Breed`) ~ "Pit Bull Group",
+    grepl("Retriever", `Primary Breed`) ~ "Retriever Group",
+    grepl("Shepherd", `Primary Breed`) ~ "Shepherd Group",
+    grepl("Chihuahua", `Primary Breed`) ~ "Chihuahua Group",
+    grepl("Terrier", `Primary Breed`) ~ "Terrier Group",
+    grepl("Hound", `Primary Breed`) ~ "Hound Group",
+    grepl("Husky", `Primary Breed`) ~ "Husky Group",
+    grepl("Boxer", `Primary Breed`) ~ "Boxer Group",
+    TRUE ~ "Other/Small Mix"
+  )) %>%
+  rename(Spayed_Neutered = "Spayed/Neutered") %>%
+  mutate(
+    Breed_Cluster = as.factor(Breed_Cluster),
+    Spayed_Neutered = as.factor(str_to_title(as.character(Spayed_Neutered))),
+    Sex = as.factor(Sex)
+  ) %>%
+  filter(!is.na(Age_at_Intake), Age_at_Intake >= 0) %>%
+  dplyr::select(sqrt_days, Days_in_Shelter, Age_at_Intake, Breed_Cluster, Sex, Spayed_Neutered, Intake_Month) %>%
+  drop_na()
+
+# Train Test Split
+set.seed(4052)
+train_indices <- sample(seq_len(nrow(clean_data)), size = floor(0.8 * nrow(clean_data)))
+train_data <- clean_data[train_indices, ]
+test_data  <- clean_data[-train_indices, ]
+
+# Histograms
+p1 <- ggplot(clean_data, aes(x = Days_in_Shelter)) +
+  geom_histogram(fill = "steelblue", color = "white", bins = 30) +
+  theme_minimal() + labs(title = "Raw Days", x = "Days", y = "Count")
+
+p2 <- ggplot(clean_data, aes(x = sqrt_days)) +
+  geom_histogram(fill = "darkorange", color = "white", bins = 30) +
+  theme_minimal() + labs(title = "Square Root Days", x = "sqrt(Days)", y = "Count")
+
+grid.arrange(p1, p2, ncol = 2)
+
+# Boxplot by Breed
+ggplot(train_data, aes(x = Breed_Cluster, y = sqrt_days, fill = Breed_Cluster)) +
+  geom_boxplot() + coord_flip() + theme_minimal() +
+  labs(title = "Stay Duration by Breed Group", y = "sqrt(Days)", x = "Breed")
+
+ggplot(train_data, aes(x = Age_at_Intake, y = sqrt_days, color = Breed_Cluster)) +
+  geom_point(alpha = 0.1) + geom_smooth(method = "lm", se = FALSE) + 
+  theme_minimal() + labs(title = "Age and Breed Interaction", x = "Age", y = "sqrt(Days)")
+
+# Base vs. Enhanced MLR
+
+# Base MLR
+mlr_base <- lm(sqrt_days ~ Breed_Cluster + Sex + Spayed_Neutered + Age_at_Intake, data = train_data)
+
+# Enhanced MLR
+mlr_enhanced <- lm(sqrt_days ~ Breed_Cluster + Sex + Spayed_Neutered + Intake_Month +
+                     Age_at_Intake + I(Age_at_Intake^2) + Age_at_Intake:Breed_Cluster, 
+                   data = train_data)
+
+# Residual Plots for Enhanced Model
+plot(mlr_enhanced)
+
+# VIF
+print(vif(mlr_enhanced, type = "predictor"))
+
+# LASSO
+formula_enhanced <- as.formula(sqrt_days ~ Breed_Cluster + Sex + Spayed_Neutered + Intake_Month + 
+                                Age_at_Intake + I(Age_at_Intake^2) + Age_at_Intake:Breed_Cluster)
+
+x_train <- model.matrix(formula_enhanced, train_data)[, -1]
+y_train <- train_data$sqrt_days
+x_test  <- model.matrix(formula_enhanced, test_data)[, -1]
+
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1)
+plot(cv_lasso) # LASSO CV Plot
+lasso_enhanced <- glmnet(x_train, y_train, alpha = 1, lambda = cv_lasso$lambda.min)
+coef(cv_lasso, s = "lambda.min")
+
+# Random Forest
+rf_enhanced <- randomForest(sqrt_days ~ Breed_Cluster + Sex + Spayed_Neutered + 
+                             Age_at_Intake + Intake_Month, 
+                           data = train_data, ntree = 500, importance = TRUE)
+varImpPlot(rf_enhanced) # RF Variable Importance Plot
+
+# Comparison
+mlr_base_preds     <- predict(mlr_base, newdata = test_data)
+mlr_enhanced_preds <- predict(mlr_enhanced, newdata = test_data)
+lasso_preds        <- as.vector(predict(lasso_enhanced, newx = x_test))
+rf_preds           <- predict(rf_enhanced, newdata = test_data)
+
+rmse <- function(actual, predicted) { sqrt(mean((actual - predicted)^2)) }
+
+performance_table <- data.frame(
+  Model = c("Base MLR", "Enhanced MLR", "Enhanced LASSO", "Enhanced Random Forest"),
+  RMSE = c(rmse(test_data$sqrt_days, mlr_base_preds),
+           rmse(test_data$sqrt_days, mlr_enhanced_preds),
+           rmse(test_data$sqrt_days, lasso_preds),
+           rmse(test_data$sqrt_days, rf_preds)),
+  Adj_R2 = c(summary(mlr_base)$adj.r.squared, summary(mlr_enhanced)$adj.r.squared, NA, NA)
+)
+print(performance_table)
+```
+
+```{r}
+summary(mlr_enhanced)
+```
+
+```{r}
+rf_preds <- predict(rf_enhanced, newdata = test_data)
+
+# Random Forest Residual vs. Fitter Plot
+rf_residuals <- test_data$sqrt_days - rf_preds
+
+rf_plot_data <- data.frame(Predicted = rf_preds, Residuals = rf_residuals)
+
+ggplot(rf_plot_data, aes(x = Predicted, y = Residuals)) +
+  geom_point(alpha = 0.4, color = "darkgreen") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", color = "black", se = FALSE) + # Adds a trend line
+  theme_minimal() +
+  labs(title = "Random Forest: Residuals vs. Predicted Values",
+       x = "Predicted Values (sqrt_days)",
+       y = "Residuals")
+```
